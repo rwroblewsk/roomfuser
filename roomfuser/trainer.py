@@ -15,20 +15,22 @@
 
 import matplotlib.pyplot as plt
 import os
-from roomfuser.dataset.roomfuser_dataset import RirDataset
+#from roomfuser.dataset.roomfuser_dataset import RirDataset
 import torch
+import numpy as np
 import torch.nn as nn
+import auraloss
 
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.tensorboard import SummaryWriter
 from torchinfo import summary
 from tqdm import tqdm
 
-from roomfuser.dataset import from_path, RandomSinusoidDataset, FastRirDataset
+from roomfuser.dataset import from_path, RandomSinusoidDataset, FastRirDataset, FastRirDeEnvDataset, RirDataset
 from roomfuser.models import load_model
 
 from roomfuser.inference import predict_batch
-
+from torch.utils.data import DataLoader
 
 class Trainer:
     def __init__(self, model_dir, model, dataset, optimizer, params, *args, **kwargs):
@@ -38,12 +40,13 @@ class Trainer:
         self.dataset = dataset
         self.optimizer = optimizer
         self.params = params
-        self.autocast = torch.cuda.amp.autocast(enabled=kwargs.get("fp16", False))
-        self.scaler = torch.cuda.amp.GradScaler(enabled=kwargs.get("fp16", False))
+        self.autocast = torch.amp.autocast('cuda',enabled=kwargs.get("fp16", False))
+        self.scaler = torch.amp.GradScaler(enabled=kwargs.get("fp16", False))
         self.is_master = True
+        self.ema = None  # Add EMA support
 
         self.noise_scheduler = model.noise_scheduler
-        self.loss_fn = Loss(params.rir_len, model.device, params.loss_weight)
+        self.loss_fn = Loss(params.rir_len, model.device, params.loss_weight, params.loss)
         self.summary_writer = None
 
     def state_dict(self):
@@ -62,6 +65,7 @@ class Trainer:
             },
             "params": dict(self.params),
             "scaler": self.scaler.state_dict(),
+            "ema": self.ema.state_dict() if self.ema else None,
         }
 
     def load_state_dict(self, state_dict):
@@ -69,6 +73,13 @@ class Trainer:
             self.model.module.load_state_dict(state_dict["model"])#, strict=False)
         else:
             self.model.load_state_dict(state_dict["model"])
+
+        # Restore EMA state if available
+        if "ema" in state_dict and state_dict["ema"] is not None and self.ema is not None:
+            self.ema.load_state_dict(state_dict["ema"])
+            # Move EMA weights to the same device as the model
+            device = next(self.model.parameters()).device
+            self.ema.to_device(device)
 
     def save_to_checkpoint(self, n_epoch, filename="weights"):
         save_basename = f"{filename}-{n_epoch}.pt"
@@ -104,10 +115,20 @@ class Trainer:
                 progress_bar.update(1)
                 epoch_loss = (epoch_loss*n_batch + loss.item())/(n_batch + 1)
                 progress_bar.set_postfix(loss=epoch_loss)#**(1/2))
+            
+                # Update EMA if available
+                if self.ema is not None:
+                    self.ema.update()
+
             progress_bar.close()
 
             if self.is_master:
                 if n_epoch % self.params.n_log_epochs == 0:
+                    
+                    # Use EMA model for visualization if available
+                    if self.ema is not None:
+                        self.ema.apply_shadow()
+                    
                     # self._write_summary(n_epoch, batch, loss)
                     self._log_output_viz(
                         self.model,
@@ -116,6 +137,10 @@ class Trainer:
                         n_epoch,
                         self.model_dir,
                     )
+
+                    # Restore model weights after visualization
+                    if self.ema is not None:
+                        self.ema.restore()
             # Save the model if it's the best one so far
             if self.is_master and epoch_loss < best_loss:
                 best_loss = epoch_loss
@@ -185,6 +210,33 @@ class Trainer:
         scaler = None
         if self.params.dataset_name == "sinusoid": # Debug task
             dataset = RandomSinusoidDataset(n_sample, n_viz_samples)
+            target_samples = [
+                dataset[i] for i in range(n_viz_samples)
+            ]
+            conditioner = torch.stack(
+                [target_sample["conditioner"] for target_sample in target_samples]
+            ).to(model.device)
+            audio = torch.stack(
+                [target_sample["audio"] for target_sample in target_samples]
+            ).to(model.device)
+            labels = [target_sample["labels"] for target_sample in target_samples]
+        elif self.params.dataset_name == "fast_rir_de_env":
+            dataset = FastRirDeEnvDataset(self.params.fast_rir_dataset_path,
+            n_rir=self.params.rir_len,
+            trim_direct_path=self.params.trim_direct_path,
+            scaler_path=self.params.fast_rir_scaler_path,
+            frequency_response=self.params.frequency_response)
+
+            target_samples = [
+                dataset[i] for i in range(n_viz_samples)
+            ]
+            conditioner = torch.stack(
+                [target_sample["conditioner"] for target_sample in target_samples]
+            ).to(model.device)
+            audio = torch.stack(
+                [target_sample["rir"] for target_sample in target_samples]
+            ).to(model.device)
+            labels = [target_sample["labels"] for target_sample in target_samples]
         elif self.params.dataset_name in ["roomfuser", "fast_rir"]:
             if self.params.dataset_name == "roomfuser":
                 dataset = RirDataset(self.params.roomfuser_dataset_path, n_sample,
@@ -205,6 +257,7 @@ class Trainer:
             conditioner = torch.stack(
                 [target_sample["conditioner"] for target_sample in target_samples]
             ).to(model.device)
+            print("Conditioner shape: ", conditioner.shape)
             audio = torch.stack(
                 [target_sample["rir"] for target_sample in target_samples]
             ).to(model.device)
@@ -215,7 +268,7 @@ class Trainer:
             labels=labels, frequency_response=self.params.frequency_response,
             scaler=dataset.scaler
         )[0]
-
+        
         for i in range(n_viz_samples):
             if scaler is not None:
                 audio[i] = scaler.descale(audio[i])
@@ -242,11 +295,30 @@ class Trainer:
 
 def _train_impl(replica_id, model, dataset, args, params):
     torch.backends.cudnn.benchmark = True
+    if replica_id == 0:  # Only print from the main process
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total_params = sum(p.numel() for p in model.parameters())
+        # print(f"\n=== MODEL PARAMETERS ===")
+        # print(f"Trainable parameters: {trainable_params:,}")
+        # print(f"Total parameters: {total_params:,}")
+        # print("======================\n")
+    
     opt = torch.optim.Adam(model.parameters(), lr=params.learning_rate)
+
+    #opt = torch.optim.Adam(
+    #model.parameters(),
+    #lr=params.learning_rate,
+    #betas=(0.9, 0.999),
+    #eps=1e-8,
+    #weight_decay=0)
+    
+    # Add EMA for better inference quality
+    ema = EMA(model, decay=0.9999)
 
     learner = Trainer(
         args.model_dir, model, dataset, opt, params, fp16=args.fp16
     )
+    learner.ema = ema
     learner.is_master = replica_id == 0
     learner.restore_from_checkpoint()
     learner.train()
@@ -274,6 +346,7 @@ def train(args, params):
         device = torch.device("mps")
     model = model.to(device)
     model.device = device
+    print("DEVICE: ", device)
 
     _train_impl(0, model, dataset, args, params)
 
@@ -285,7 +358,7 @@ def train_distributed(replica_id, replica_count, port, args, params):
         "nccl", rank=replica_id, world_size=replica_count
     )
 
-    dataset = from_path(params, is_distributed=True)
+    dataset = from_path(params, is_distributed=False)
     device = torch.device("cuda", replica_id)
     torch.cuda.set_device(device)
     model = load_model(params).to(device)
@@ -297,7 +370,7 @@ def train_distributed(replica_id, replica_count, port, args, params):
 
 
 class Loss(nn.Module):
-    def __init__(self, rir_len, device, loss_weight=None):
+    def __init__(self, rir_len, device, loss_weight=None, loss=None):
         super().__init__()
         self.device = device
     
@@ -306,6 +379,8 @@ class Loss(nn.Module):
         elif loss_weight == "log":
             loss_weight = torch.linspace(rir_len, 1, rir_len, device=device)
             loss_weight = torch.log(loss_weight)
+        elif loss_weight == "lin_reverse":
+            loss_weight = torch.linspace(0, 1, rir_len-800, device=device)
         
         # Normalize the loss weight
         if loss_weight is not None:
@@ -313,8 +388,14 @@ class Loss(nn.Module):
 
         self.loss_weight = loss_weight
 
-        self.loss_fn = nn.MSELoss(reduction="none")
-        #self.loss_fn = nn.L1Loss(reduction="none")
+        if loss == "l1":
+            self.loss_fn = nn.L1Loss(reduction="none")
+        elif loss == "huber":
+            self.loss_fn = nn.SmoothL1Loss(reduction="none")
+        elif loss == "multi_spect":
+            self.loss_fn = auraloss.freq.MultiResolutionSTFTLoss()
+        else:
+            self.loss_fn = nn.MSELoss(reduction="none")
 
     def forward(self, noise, predicted):
         batch_size = noise.shape[0]
@@ -328,3 +409,57 @@ class Loss(nn.Module):
             loss = loss.mean()
 
         return loss
+
+class EMA:
+    def __init__(self, model, decay=0.9999):
+        self.model = model
+        self.decay = decay
+        self.shadow = {}
+        self.backup = {}
+        
+        # Register model parameters
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+    
+    def update(self):
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                new_average = self.decay * self.shadow[name] + (1.0 - self.decay) * param.data
+                self.shadow[name] = new_average.clone()
+    
+    def apply_shadow(self):
+        """Use the EMA parameters for inference"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.shadow
+                self.backup[name] = param.data
+                param.data = self.shadow[name]
+    
+    def restore(self):
+        """Restore the original parameters"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                assert name in self.backup
+                param.data = self.backup[name]
+        self.backup = {}
+    
+    def state_dict(self):
+        return {
+            "decay": self.decay,
+            "shadow": self.shadow,
+            "backup": self.backup
+        }
+        
+    def load_state_dict(self, state_dict):
+        self.decay = state_dict["decay"]
+        self.shadow = state_dict["shadow"]
+        self.backup = state_dict["backup"]
+
+    def to_device(self, device):
+        """Move EMA shadow weights to the specified device"""
+        for name in self.shadow:
+            self.shadow[name] = self.shadow[name].to(device)
+        for name in self.backup:
+            self.backup[name] = self.backup[name].to(device)
